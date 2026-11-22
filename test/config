@@ -1,0 +1,9 @@
+thread = 4
+harbor = 0
+start = "skynet_integration"
+bootstrap = "snlua bootstrap"
+luaservice = "$MATCH_ROOT/service/?.lua;$MATCH_ROOT/test/?.lua;./service/?.lua"
+lualoader = "./lualib/loader.lua"
+lua_path = "./lualib/?.lua;./lualib/?/init.lua"
+lua_cpath = "./luaclib/?.so"
+cpath = "./cservice/?.so"
