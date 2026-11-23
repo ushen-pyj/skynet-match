@@ -62,20 +62,21 @@ local function check_concurrent_load(mmf)
     end
     local rounds, samples = 0, {}
     repeat
+        local producers_done = active == 0
         local t = skynet.hpc()
         local groups = assert(skynet.call(actor, "lua", "run", mmf, "pairs"))
         samples[#samples + 1] = (skynet.hpc() - t) / 1e6
         rounds = rounds + 1
         for _, group in ipairs(groups) do
+            assert(#group.ids == 2)
             for _, id in ipairs(group.ids) do
                 assert(not matched[id], "ticket consumed twice: " .. id)
                 matched[id] = true
             end
         end
         assert(not producer_error, producer_error)
-    until active == 0 and skynet.call(actor, "lua", "stats").queued < 2
+    until producers_done and #groups == 0
     local elapsed = (skynet.hpc() - started) / 1e9
-    local state = skynet.call(actor, "lua", "stats")
     local nm, nc, left = 0, 0, 0
     for p = 1, workers do
         for i = 1, per_worker do
@@ -91,7 +92,7 @@ local function check_concurrent_load(mmf)
             end
         end
     end
-    assert(nm == 2 * state.matched and left == state.queued and state.failures == 0)
+    assert(left < 2 and nm + nc + left == workers * per_worker)
     table.sort(samples)
     print(("mixed tickets=%d matched=%d cancelled=%d left=%d rounds=%d tickets/s=%.0f run_p99=%.3fms"):format(
         workers * per_worker, nm, nc, left, rounds, workers * per_worker / elapsed,
@@ -105,7 +106,9 @@ local function check()
     local function call(op, ...)
         return skynet.call(pool, "lua", op, ...)
     end
-    assert(call("enqueue", "a", {version = 1}))
+    skynet.send(pool, "lua", "run", mmf, nil, "empty")
+    assert(call("ack", "empty"))
+    skynet.send(pool, "lua", "enqueue", "a", {version = 1})
     local result, err = call("run", mmf, "slow", "lost")
     assert(not result and err == "timeout")
     assert(call("cancel", "a"))
@@ -115,7 +118,6 @@ local function check()
     assert(call("enqueue", "b"))
     skynet.sleep(35) -- A's old RPC has now had time to respond.
     assert(call("run", mmf, nil, "success")[1].ids[1] == "a")
-    assert(call("stats").queued == 1)
     assert(call("ack", "success"))
     assert(call("run", mmf, nil, "next")[1].ids[1] == "b")
     assert(call("enqueue", "race"))
@@ -137,12 +139,14 @@ local function check()
     for i, invalid in ipairs({{}, {"c", "c"}, {"unknown"}, {[2] = "c"}}) do
         local first = i % 2 == 1 and "a" or "c"
         expect_error("invalid_proposals", "run", mmf, {proposals = {{ids = {first}}, {ids = invalid}}})
-        assert(call("stats").queued == 4)
+        expect_error("queue_full", "enqueue", "e")
     end
     expect_error("result_too_large", "run", mmf, "oversized", "retry")
-    assert(call("stats").queued == 4 and call("stats").receipts == 0)
+    expect_error("queue_full", "enqueue", "e")
+    assert(not call("ack", "retry"))
     local groups = assert(call("run", mmf, {proposals = {{ids = {"c", "d"}}, {ids = {"d"}}}}, "retry"))
-    assert(#groups == 1 and #groups[1].ids == 2 and call("stats").queued == 2)
+    assert(#groups == 1 and #groups[1].ids == 2)
+    assert(not call("cancel", "c") and not call("cancel", "d"))
     expect_error("receipts_full", "run", mmf, nil, "another")
     assert(call("ack", "retry") and not call("ack", "retry"))
     local stopped = skynet.newservice("skynet_integration", "mmf")

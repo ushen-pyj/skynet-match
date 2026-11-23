@@ -18,8 +18,6 @@ local ticket_bytes, result_bytes = 8192, 262144
 local pending, head, count = {}, nil, 0
 local receipts, receipt_count = {}, 0
 local running = false
-local metrics = { rounds = 0, timeouts = 0, failures = 0, matched = 0,
-    skipped = 0, full = 0, last_ticks = 0, last_candidates = 0 }
 local command = {}
 
 local function valid_id(id)
@@ -29,10 +27,7 @@ end
 function command.enqueue(id, data)
     if not valid_id(id) then return nil, "invalid_id" end
     if pending[id] then return nil, "already_queued" end
-    if count == capacity then
-        metrics.full = metrics.full + 1
-        return nil, "queue_full"
-    end
+    if count == capacity then return nil, "queue_full" end
     local ticket = { id = id, data = data }
     if #skynet.packstring(ticket) > ticket_bytes then return nil, "ticket_too_large" end
     local node = { ticket = ticket }
@@ -118,7 +113,6 @@ end
 
 local function evaluate(worker, profile, request_id)
     local tickets, by_id = snapshot()
-    metrics.last_candidates = #tickets
     local proposals = {}
     if #tickets > 0 then
         local rpc = skynet.request(table.pack(worker, "lua", "run", profile, tickets))
@@ -139,8 +133,6 @@ local function evaluate(worker, profile, request_id)
         receipt_count = receipt_count + 1
     end
     for id in pairs(claimed) do remove(pending[id]) end
-    metrics.matched = metrics.matched + #accepted
-    metrics.skipped = metrics.skipped + #proposals - #accepted
     return packed
 end
 
@@ -153,18 +145,13 @@ local function run(worker, profile, request_id)
     if running then return nil, "busy" end
     if request_id and receipt_count == receipt_limit then return nil, "receipts_full" end
     if #skynet.packstring(profile) > ticket_bytes then return nil, "profile_too_large" end
-    local start = skynet.now()
     running = true
     local ok, result, reason = pcall(evaluate, worker, profile, request_id)
     running = false
-    metrics.rounds = metrics.rounds + 1
-    metrics.last_ticks = skynet.now() - start
     if not ok then
         skynet.error("matchmaker run failed", result)
-        result, reason = nil, "run_failed"
+        return nil, "run_failed"
     end
-    if reason == "timeout" then metrics.timeouts = metrics.timeouts + 1 end
-    if not result then metrics.failures = metrics.failures + 1 end
     return result, reason
 end
 
@@ -175,16 +162,8 @@ function command.ack(request_id)
     return true
 end
 
-function command.stats()
-    local s = { queued = count, capacity = capacity, batch = batch, running = running,
-        timeout_ticks = timeout, receipts = receipt_count, receipt_limit = receipt_limit }
-    for k, v in pairs(metrics) do s[k] = v end
-    return s
-end
-
 skynet.start(function()
-    skynet.dispatch("lua", function(session, _, op, ...)
-        if session == 0 then return end
+    skynet.dispatch("lua", function(_, _, op, ...)
         if op == "run" then
             local packed, err = run(...)
             if packed then
